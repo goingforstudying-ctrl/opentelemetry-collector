@@ -145,7 +145,9 @@ func NewCollector(set CollectorSettings) (*Collector, error) {
 		// Per signal.Notify documentation, a size of the channel equaled with
 		// the number of signals getting notified on is recommended.
 		signalsChannel:             make(chan os.Signal, 3),
-		asyncErrorChannel:          make(chan error),
+		// Buffered so the first fatal error is retained and extra ones coalesce
+		// without spawning a goroutine that would leak after shutdown.
+		asyncErrorChannel:          make(chan error, 1),
 		configProvider:             configProvider,
 		bc:                         bc,
 		updateConfigProviderLogger: cc.SetCore,
