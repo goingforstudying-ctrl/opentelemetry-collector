@@ -206,8 +206,12 @@ func (e *baseExporter) export(ctx context.Context, requestURL string, request []
 	}()
 
 	if resp.StatusCode >= 200 && resp.StatusCode <= 299 {
+		// The server has accepted the data, so the export succeeded even
+		// when the response body cannot be read or parsed: all that is lost
+		// are the partial success details. Returning an error here would
+		// report accepted data as dropped, and retrying would duplicate it.
 		if err := handlePartialSuccessResponse(resp, partialSuccessHandler); err != nil {
-			return consumererror.NewPermanent(err)
+			e.logger.Warn("Server accepted the data, but the response body could not be processed; partial success details are unavailable", zap.Error(err))
 		}
 		return nil
 	}

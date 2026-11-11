@@ -714,6 +714,92 @@ func TestPartialResponse_nonErrUnexpectedEOFError(t *testing.T) {
 	assert.Error(t, err)
 }
 
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+// newTestExporter builds a baseExporter whose HTTP client is driven by rt,
+// so tests can script the exact response the server would have sent.
+func newTestExporter(t *testing.T, logger *zap.Logger, rt http.RoundTripper) *baseExporter {
+	set := exportertest.NewNopSettings(metadata.Type)
+	set.Logger = logger
+	exp, err := newExporter(createDefaultConfig(), set)
+	require.NoError(t, err)
+	exp.tracesURL = "http://localhost/v1/traces"
+	exp.metricsURL = "http://localhost/v1/metrics"
+	exp.logsURL = "http://localhost/v1/logs"
+	exp.profilesURL = "http://localhost/v1development/profiles"
+	exp.client = &http.Client{Transport: rt}
+	return exp
+}
+
+// The server accepted the data (2xx) but the connection broke before the
+// response body could be read, e.g. an HTTP/2 GOAWAY right after the
+// response headers. The export must count as successful: nothing was lost,
+// and retrying would duplicate the accepted data.
+func TestExportSuccessWithUnreadableResponseBody(t *testing.T) {
+	telemetryTypes := []struct {
+		name string
+		push func(e *baseExporter) error
+	}{
+		{tracesTelemetryType, func(e *baseExporter) error { return e.pushTraces(context.Background(), ptrace.NewTraces()) }},
+		{metricsTelemetryType, func(e *baseExporter) error { return e.pushMetrics(context.Background(), pmetric.NewMetrics()) }},
+		{logsTelemetryType, func(e *baseExporter) error { return e.pushLogs(context.Background(), plog.NewLogs()) }},
+		{profilesTelemetryType, func(e *baseExporter) error { return e.pushProfiles(context.Background(), pprofile.NewProfiles()) }},
+	}
+
+	for _, tt := range telemetryTypes {
+		t.Run(tt.name, func(t *testing.T) {
+			core, observed := observer.New(zap.WarnLevel)
+			exp := newTestExporter(t, zap.New(core), roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					ContentLength: 100,
+					Header:        http.Header{"Content-Type": {protobufContentType}},
+					Body:          io.NopCloser(badReader{}),
+				}, nil
+			}))
+
+			require.NoError(t, tt.push(exp))
+			assert.Equal(t, 1, observed.FilterMessageSnippet("could not be processed").Len())
+		})
+	}
+}
+
+// Same as above, but the body is readable and yet not a valid
+// ExportResponse for the response Content-Type. The accepted data must
+// still count as successful; only the partial success details are lost.
+func TestExportSuccessWithInvalidResponseBody(t *testing.T) {
+	telemetryTypes := []struct {
+		name string
+		push func(e *baseExporter) error
+	}{
+		{tracesTelemetryType, func(e *baseExporter) error { return e.pushTraces(context.Background(), ptrace.NewTraces()) }},
+		{metricsTelemetryType, func(e *baseExporter) error { return e.pushMetrics(context.Background(), pmetric.NewMetrics()) }},
+		{logsTelemetryType, func(e *baseExporter) error { return e.pushLogs(context.Background(), plog.NewLogs()) }},
+		{profilesTelemetryType, func(e *baseExporter) error { return e.pushProfiles(context.Background(), pprofile.NewProfiles()) }},
+	}
+
+	for _, tt := range telemetryTypes {
+		t.Run(tt.name, func(t *testing.T) {
+			core, observed := observer.New(zap.WarnLevel)
+			exp := newTestExporter(t, zap.New(core), roundTripperFunc(func(*http.Request) (*http.Response, error) {
+				return &http.Response{
+					StatusCode:    http.StatusOK,
+					ContentLength: 4,
+					Header:        http.Header{"Content-Type": {protobufContentType}},
+					Body:          io.NopCloser(bytes.NewReader([]byte{0xff, 0xff, 0xff, 0xff})),
+				}, nil
+			}))
+
+			require.NoError(t, tt.push(exp))
+			assert.Equal(t, 1, observed.FilterMessageSnippet("could not be processed").Len())
+		})
+	}
+}
+
 func TestPartialSuccess_shortContentLengthHeader(t *testing.T) {
 	cfg := createDefaultConfig()
 	set := exportertest.NewNopSettings(metadata.Type)
@@ -1247,7 +1333,10 @@ func TestPartialSuccess_responseBodyTooLarge(t *testing.T) {
 		Encoding:        EncodingProto,
 		MetricsEndpoint: srv.URL + "/v1/metrics",
 	}
-	exp, err := createMetrics(context.Background(), exportertest.NewNopSettings(metadata.Type), cfg)
+	core, observed := observer.New(zap.WarnLevel)
+	set := exportertest.NewNopSettings(metadata.Type)
+	set.Logger = zap.New(core)
+	exp, err := createMetrics(context.Background(), set, cfg)
 	require.NoError(t, err)
 	err = exp.Start(context.Background(), componenttest.NewNopHost())
 	require.NoError(t, err)
@@ -1255,10 +1344,12 @@ func TestPartialSuccess_responseBodyTooLarge(t *testing.T) {
 		require.NoError(t, exp.Shutdown(context.Background()))
 	}()
 
+	// The server accepted the data with a 200. The response body is larger
+	// than the read cap, so the truncated buffer fails to parse and only
+	// the partial success details are lost: the export counts as success.
 	err = exp.ConsumeMetrics(context.Background(), pmetric.NewMetrics())
-	require.Error(t, err)
-	assert.True(t, consumererror.IsPermanent(err))
-	assert.Contains(t, err.Error(), "error parsing protobuf response:")
+	require.NoError(t, err)
+	assert.Equal(t, 1, observed.FilterMessageSnippet("could not be processed").Len())
 }
 
 func TestExport_StatusErrorShowsResolvedURL(t *testing.T) {
