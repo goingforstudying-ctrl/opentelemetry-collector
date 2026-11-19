@@ -1315,6 +1315,91 @@ func TestCollectorSendSignal(t *testing.T) {
 	assert.Equal(t, StateClosed, col.GetState())
 }
 
+// errorShutdownExtension fails the first time it is shut down, which makes
+// shutting down the retiring config fail during a reload. Later shutdowns
+// succeed so the Collector's final shutdown is clean.
+type errorShutdownExtension struct {
+	component.StartFunc
+	shutdownCount *atomic.Int64
+}
+
+func (e errorShutdownExtension) Shutdown(context.Context) error {
+	if e.shutdownCount.Add(1) == 1 {
+		return errors.New("shutdown failed")
+	}
+	return nil
+}
+
+func newErrorShutdownCollector(t *testing.T) *Collector {
+	shutdownCount := &atomic.Int64{}
+	factory := extension.NewFactory(
+		component.MustNewType("errorshutdown"),
+		func() component.Config { return &struct{}{} },
+		func(context.Context, extension.Settings, component.Config) (extension.Extension, error) {
+			return errorShutdownExtension{shutdownCount: shutdownCount}, nil
+		},
+		component.StabilityLevelStable,
+	)
+
+	factories, err := nopFactories()
+	require.NoError(t, err)
+	factories.Extensions[factory.Type()] = factory
+
+	col, err := NewCollector(CollectorSettings{
+		BuildInfo:              component.NewDefaultBuildInfo(),
+		Factories:              func() (Factories, error) { return factories, nil },
+		ConfigProviderSettings: newDefaultConfigProviderSettings(t, []string{filepath.Join("testdata", "otelcol-errorshutdown.yaml")}),
+	})
+	require.NoError(t, err)
+	return col
+}
+
+func TestCollectorReloadShutdownErrorGateDisabled(t *testing.T) {
+	col := newErrorShutdownCollector(t)
+
+	wg := sync.WaitGroup{}
+	wg.Go(func() {
+		assert.EqualError(t, col.Run(context.Background()), "failed to shutdown the retiring config: failed to shutdown extensions: shutdown failed")
+	})
+
+	assert.Eventually(t, func() bool {
+		return StateRunning == col.GetState()
+	}, 2*time.Second, 200*time.Millisecond)
+
+	col.signalsChannel <- SIGHUP
+
+	wg.Wait()
+	assert.Equal(t, StateClosing, col.GetState())
+}
+
+func TestCollectorReloadShutdownErrorGateEnabled(t *testing.T) {
+	require.NoError(t, featuregate.GlobalRegistry().Set("pkg.otelcol.continueOnReloadShutdownError", true))
+	defer func() {
+		require.NoError(t, featuregate.GlobalRegistry().Set("pkg.otelcol.continueOnReloadShutdownError", false))
+	}()
+
+	col := newErrorShutdownCollector(t)
+
+	wg := startCollector(context.Background(), t, col)
+
+	assert.Eventually(t, func() bool {
+		return StateRunning == col.GetState()
+	}, 2*time.Second, 200*time.Millisecond)
+
+	col.signalsChannel <- SIGHUP
+
+	// The reload survives the failed shutdown of the retiring config and the
+	// Collector comes back up with the new configuration.
+	assert.Eventually(t, func() bool {
+		return StateRunning == col.GetState()
+	}, 2*time.Second, 200*time.Millisecond)
+
+	col.signalsChannel <- SIGTERM
+
+	wg.Wait()
+	assert.Equal(t, StateClosed, col.GetState())
+}
+
 func TestCollectorFailedShutdown(t *testing.T) {
 	t.Skip("This test was using telemetry shutdown failure, switch to use a component that errors on shutdown.")
 
